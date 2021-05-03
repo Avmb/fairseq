@@ -42,7 +42,7 @@ def save_checkpoint(cfg: CheckpointConfig, trainer, epoch_itr, val_loss):
     if cfg.no_save:
         return
 
-    trainer.consolidate_optimizer()
+    trainer.consolidate_optimizer()  # TODO(SS): do we need this if no_save_optimizer_state
 
     if not trainer.should_save_checkpoint_on_current_rank:
         return
@@ -114,16 +114,25 @@ def save_checkpoint(cfg: CheckpointConfig, trainer, epoch_itr, val_loss):
 
     if not end_of_epoch and cfg.keep_interval_updates > 0:
         # remove old checkpoints; checkpoints are sorted in descending order
-        checkpoints = checkpoint_paths(
-            cfg.save_dir, pattern=r"checkpoint_\d+_(\d+)\.pt"
-        )
+        if cfg.keep_interval_updates_pattern == -1:
+            checkpoints = checkpoint_paths(
+                cfg.save_dir, pattern=r"checkpoint_\d+_(\d+){}\.pt".format(suffix)
+            )
+        else:
+            checkpoints = checkpoint_paths(
+                cfg.save_dir, pattern=r"checkpoint_\d+_(\d+){}\.pt".format(suffix), keep_match=True
+            )
+            checkpoints = [x[0] for x in checkpoints if x[1] % cfg.keep_interval_updates_pattern != 0]
+
         for old_chk in checkpoints[cfg.keep_interval_updates :]:
             if os.path.lexists(old_chk):
                 os.remove(old_chk)
+            elif PathManager.exists(old_chk):
+                PathManager.rm(old_chk)
 
     if cfg.keep_last_epochs > 0:
         # remove old epoch checkpoints; checkpoints are sorted in descending order
-        checkpoints = checkpoint_paths(cfg.save_dir, pattern=r"checkpoint(\d+)\.pt")
+        checkpoints = checkpoint_paths(cfg.save_dir, pattern=r"checkpoint(\d+){}\.pt".format(suffix))
         for old_chk in checkpoints[cfg.keep_last_epochs :]:
             if os.path.lexists(old_chk):
                 os.remove(old_chk)
@@ -132,8 +141,8 @@ def save_checkpoint(cfg: CheckpointConfig, trainer, epoch_itr, val_loss):
         # only keep the best N checkpoints according to validation metric
         checkpoints = checkpoint_paths(
             cfg.save_dir,
-            pattern=r"checkpoint\.best_{}_(\d+\.?\d*)\.pt".format(
-                cfg.best_checkpoint_metric
+            pattern=r"checkpoint\.best_{}_(\d+\.?\d*){}\.pt".format(
+                cfg.best_checkpoint_metric, suffix
             ),
         )
         if not cfg.maximize_best_checkpoint_metric:
@@ -386,7 +395,7 @@ def load_model_ensemble_and_task(
     return ensemble, cfg, task
 
 
-def checkpoint_paths(path, pattern=r"checkpoint(\d+)\.pt"):
+def checkpoint_paths(path, pattern=r"checkpoint(\d+)\.pt", keep_match=False):
     """Retrieves all checkpoints found in `path` directory.
 
     Checkpoints are identified by matching filename to the specified pattern. If
@@ -394,7 +403,7 @@ def checkpoint_paths(path, pattern=r"checkpoint(\d+)\.pt"):
     descending order.
     """
     pt_regexp = re.compile(pattern)
-    files = os.listdir(path)
+    files = PathManager.ls(path)
 
     entries = []
     for i, f in enumerate(files):
@@ -402,7 +411,10 @@ def checkpoint_paths(path, pattern=r"checkpoint(\d+)\.pt"):
         if m is not None:
             idx = float(m.group(1)) if len(m.groups()) > 0 else i
             entries.append((idx, m.group(0)))
-    return [os.path.join(path, x[1]) for x in sorted(entries, reverse=True)]
+    if keep_match:
+        return [(os.path.join(path, x[1]), x[0]) for x in sorted(entries, reverse=True)]
+    else:
+        return [os.path.join(path, x[1]) for x in sorted(entries, reverse=True)]
 
 
 def torch_persistent_save(obj, filename, async_write: bool = False):

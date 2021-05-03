@@ -26,7 +26,7 @@ from fairseq.nan_detector import NanDetector
 from fairseq.optim import lr_scheduler
 
 from omegaconf import OmegaConf
-
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +195,7 @@ class Trainer(object):
     @property
     def should_save_checkpoint_on_current_rank(self) -> bool:
         """Indicates whether to save checkpoints on the current DDP rank."""
-        if self.cfg.distributed_training.ddp_backend == "fully_sharded":
+        if self.cfg.distributed_training.ddp_backend == "fully_sharded" or getattr(self.cfg.model, "base_layers", 0) > 0:
             return True
         else:
             return self.is_data_parallel_master
@@ -331,8 +331,17 @@ class Trainer(object):
 
     def consolidate_optimizer(self):
         """For OSS, we need to consolidate the state dict."""
+        if self.cfg.checkpoint.no_save_optimizer_state:
+            return
+        self._gathered_optim_state = None
         if hasattr(self.optimizer.optimizer, "consolidate_state_dict"):
             self.optimizer.optimizer.consolidate_state_dict()
+
+        elif self.cfg.distributed_training.ddp_backend == 'fully_sharded' and not self.model.use_sharded_state:
+            st = self.model.gather_full_optim_state_dict(self.optimizer) # only returns on rank 0
+            if st is None:
+                st = -1  # sentinel so that workers do not save optimizer.state_dict()
+            self._gathered_optim_state = st
 
     def state_dict(self):
         state_dict = {
@@ -362,7 +371,11 @@ class Trainer(object):
             }
         }
         if not self.cfg.checkpoint.no_save_optimizer_state:
-            state_dict["last_optimizer_state"] = self.optimizer.state_dict()
+            if self._gathered_optim_state is not None:
+                state_dict["last_optimizer_state"] = self._gathered_optim_state
+                self._gathered_optim_state = None
+            else:
+                state_dict["last_optimizer_state"] = self.optimizer.state_dict()
         return state_dict
 
     def save_checkpoint(self, filename, extra_state):
@@ -405,6 +418,7 @@ class Trainer(object):
                 or self.tpu
                 # FSDP requires loading checkpoint shards on all ranks
                 or self.cfg.distributed_training.ddp_backend == "fully_sharded"
+                or getattr(self.cfg.model, "base_layers", 0) > 0
             )
 
             if load_on_all_ranks or self.data_parallel_rank == 0:
@@ -412,6 +426,10 @@ class Trainer(object):
                     filename, load_on_all_ranks=load_on_all_ranks
                 )
                 last_optim_state = state.get("last_optimizer_state", None)
+                if last_optim_state == -1:
+                    master_path = re.sub("shard[0-9]+", "shard0", filename)
+                    local_master_path = PathManager.get_local_path(master_path)
+                    last_optim_state = torch.load(local_master_path, map_location='cpu')['last_optimizer_state']
 
                 # If doing zero_sharding, do not broadcast global optimizer
                 # state. Later we will broadcast sharded states to each rank
@@ -478,6 +496,9 @@ class Trainer(object):
                 last_optim_state = self.optimizer.broadcast_global_state_dict(
                     last_optim_state
                 )
+            elif self.cfg.distributed_training.ddp_backend == 'fully_sharded':
+                last_optim_state = self.model.get_shard_from_optim_state_dict(last_optim_state)
+
             self.optimizer.load_state_dict(last_optim_state, optimizer_overrides)
 
             self.set_num_updates(last_optim["num_updates"])
@@ -532,6 +553,7 @@ class Trainer(object):
                 epoch=epoch,
                 combine=combine,
                 data_selector=data_selector,
+                tpu=self.tpu,
             )
         batch_iterator = self.task.get_batch_iterator(
             dataset=self.task.dataset(self.cfg.dataset.train_subset),
@@ -684,9 +706,7 @@ class Trainer(object):
                 # before marking step can lead to OOM errors.
                 # To handle gradient accumulation use case, we explicitly
                 # mark step here for every forward pass without a backward pass
-                import torch_xla.core.xla_model as xm
-
-                xm.mark_step()
+                self._xla_markstep_and_send_to_cpu()
 
         if is_dummy_batch:
             if torch.is_tensor(sample_size):
@@ -806,10 +826,10 @@ class Trainer(object):
             self.set_num_updates(self.get_num_updates() + 1)
 
             if self.tpu:
-                # mark step on TPUs
                 import torch_xla.core.xla_model as xm
 
-                xm.mark_step()
+                # mark step on TPUs
+                self._xla_markstep_and_send_to_cpu()
 
                 # only log stats every log_interval steps
                 # this causes wps to be misreported when log_interval > 1
@@ -825,7 +845,7 @@ class Trainer(object):
                     metrics.log_scalar(
                         "gb_total", gb_total, priority=1600, round=1, weight=0
                     )
-
+                    logging_outputs = self._xla_markstep_and_send_to_cpu(logging_outputs)
                     logging_output = self._reduce_and_log_stats(
                         logging_outputs, sample_size, grad_norm
                     )
@@ -878,9 +898,7 @@ class Trainer(object):
         """Do forward pass in evaluation mode."""
         if self.tpu:
             import torch_xla.core.xla_model as xm
-
             xm.rendezvous("valid_step")  # wait for all workers
-            xm.mark_step()
 
         with torch.no_grad():
             self.model.eval()
@@ -923,6 +941,8 @@ class Trainer(object):
             )
 
         # log validation stats
+        if self.tpu:
+            logging_outputs = self._xla_markstep_and_send_to_cpu(logging_outputs)
         logging_output = self._reduce_and_log_stats(logging_outputs, sample_size)
 
         return logging_output
@@ -1299,6 +1319,13 @@ class Trainer(object):
                 )
             )
         self._num_xla_compiles = num_xla_compiles
+
+    def _xla_markstep_and_send_to_cpu(self, data=None):
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+        if data is not None:
+            from fairseq.utils import xla_device_to_cpu
+            return xla_device_to_cpu(data)
 
 
 def _catalog_shared_params(module, memo=None, prefix=""):

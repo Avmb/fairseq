@@ -95,6 +95,9 @@ class CommonConfig(FairseqDataclass):
     log_format: Optional[LOG_FORMAT_CHOICES] = field(
         default=None, metadata={"help": "log format to use"}
     )
+    log_file: Optional[str] = field(
+        default=None, metadata={"help": "log file to copy metrics to."}
+    )
     tensorboard_logdir: Optional[str] = field(
         default=None,
         metadata={
@@ -448,6 +451,8 @@ class DatasetConfig(FairseqDataclass):
             "argparse_alias": "--max-sentences-valid",
         },
     )
+    max_valid_steps: Optional[int] = field(default=None, metadata={'help': 'How many batches to evaluate',
+                                                                   "argparse_alias": "--nval"})
     curriculum: int = field(
         default=0, metadata={"help": "don't shuffle batches for first N epochs"}
     )
@@ -564,6 +569,14 @@ class CheckpointConfig(FairseqDataclass):
         default=-1,
         metadata={
             "help": "keep the last N checkpoints saved with --save-interval-updates"
+        },
+    )
+    keep_interval_updates_pattern: int = field(
+        default=-1,
+        metadata={
+            "help": "when used with --keep-interval-updates, skips deleting "
+                    "any checkpoints with update X where "
+                    "X %% keep_interval_updates_pattern == 0"
         },
     )
     keep_last_epochs: int = field(

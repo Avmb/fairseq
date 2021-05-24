@@ -36,8 +36,9 @@ class RND(nn.Module):
         self.base_layers = []
         self.student_layers = []
         for layer_id in range(self.rnd_base_n_hidden_layers):
-            self.base_layers.append(nn.LayerNorm(self.hidden_dim, elementwise_affine=False))
-            self.student_layers.append(nn.LayerNorm(self.hidden_dim, elementwise_affine=False))
+            if not args.rnd_no_layernorm_in_base_layers:
+                self.base_layers.append(nn.LayerNorm(self.hidden_dim, elementwise_affine=False))
+                self.student_layers.append(nn.LayerNorm(self.hidden_dim, elementwise_affine=False))
             self.base_layers.append(nn.Linear(self.hidden_dim, self.hidden_dim, bias=False))
             self.student_layers.append(nn.Linear(self.hidden_dim, self.hidden_dim, bias=False))
             self.base_layers.append(nn.LeakyReLU())
@@ -56,10 +57,13 @@ class RND(nn.Module):
             self.res_blocks.append(res_block)
         self.res_blocks = nn.ModuleList(self.res_blocks)
         
-        self.base_proj = nn.Sequential(nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
-                                        nn.LayerNorm(self.hidden_dim, elementwise_affine=False))
-        self.student_proj = nn.Sequential(nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
-                                           nn.LayerNorm(self.hidden_dim, elementwise_affine=False))
+        base_proj_layers = [nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)]
+        student_proj_layers = [nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)]
+        if not args.rnd_no_layernorm_in_projection_layers:
+            base_proj_layers.append(nn.LayerNorm(self.hidden_dim, elementwise_affine=False))
+            student_proj_layers.append(nn.LayerNorm(self.hidden_dim, elementwise_affine=False))
+        self.base_proj = nn.Sequential(*base_proj_layers)
+        self.student_proj = nn.Sequential(*student_proj_layers)
         for param in self.base_proj.parameters():
             param.requires_grad = False
                                            
@@ -154,6 +158,7 @@ class GRURNDDecoder(FairseqIncrementalDecoder):
             ]
         )
 
+        self.out_rnd = None
         if attention:
             # TODO make bias configurable
             #self.attention = AttentionLayer(
@@ -166,8 +171,16 @@ class GRURNDDecoder(FairseqIncrementalDecoder):
                 vdim=encoder_output_units,
                 dropout=args.attention_dropout,
                 encoder_decoder_attention=True,)
+            if self.args.rnd_ood_scaling_on_attention_head_value:
+                self.out_rnd = RND(
+                    args,
+                    hidden_size,
+                )
         else:
             self.attention = None
+            
+        if args.decoder_hidden_state_in_output:
+            self.hidden_attn_combination_fc = Linear(2*hidden_size, hidden_size, bias=False)
 
         if hidden_size != out_embed_dim:
             self.additional_fc = Linear(hidden_size, out_embed_dim)
@@ -256,6 +269,7 @@ class GRURNDDecoder(FairseqIncrementalDecoder):
             x.new_zeros(srclen, seqlen, bsz) if self.attention is not None else None
         )
         outs = []
+        rnd_err_acc = []
         for j in range(seqlen):
             # input feeding: concatenate context vector from previous time step
             if input_feed is not None:
@@ -263,10 +277,17 @@ class GRURNDDecoder(FairseqIncrementalDecoder):
             else:
                 input = x[j]
 
+            cur_rnd_err_acc = None
             for i, rnn in enumerate(self.layers):
                 # recurrent cell
                 hidden = rnn(input, prev_hiddens[i])
+
+                # Compute RND error
                 rnd_err = self.rnd_layers[i](hidden.detach())
+                if self.args.rnd_keep_ood_loss:
+                    cur_rnd_err_acc = rnd_err if (i == 0) else cur_rnd_err_acc + rnd_err
+                if self.args.rnd_detach_model_gradient_from_ood_loss:
+                    rnd_err = rnd_err.detach()
 
                 # hidden state becomes the input to the next layer
                 input = self.dropout_out_module(hidden)
@@ -298,7 +319,16 @@ class GRURNDDecoder(FairseqIncrementalDecoder):
                     attn_scores[:, j, :] = attn_out[1].squeeze(1).transpose(0, 1) # B x SRCLEN
             else:
                 out = hidden
+            if self.args.decoder_hidden_state_in_output:
+                out = self.hidden_attn_combination_fc(torch.cat((out, hidden), dim=-1))
             out = self.dropout_out_module(out)
+            
+            if self.out_rnd != None:
+                rnd_err = self.out_rnd((hidden.detach()))
+                if self.args.rnd_keep_ood_loss:
+                    cur_rnd_err_acc = cur_rnd_err_acc + rnd_err
+                if self.args.rnd_detach_model_gradient_from_ood_loss:
+                    rnd_err = rnd_err.detach()
             out = rnd_project(out, rnd_err, self.rnd_scale_output, self.rnd_gain_output)
 
             # input feeding
@@ -307,6 +337,9 @@ class GRURNDDecoder(FairseqIncrementalDecoder):
 
             # save final output
             outs.append(out)
+            
+            # save final RND error
+            rnd_err_acc.append(cur_rnd_err_acc)
 
         # Stack all the necessary tensors together and store
         prev_hiddens_tensor = torch.stack(prev_hiddens)
@@ -321,6 +354,8 @@ class GRURNDDecoder(FairseqIncrementalDecoder):
 
         # collect outputs across time steps
         x = torch.cat(outs, dim=0).view(seqlen, bsz, self.hidden_size)
+        if self.args.rnd_keep_ood_loss:
+            rnd_err_acc = torch.cat(rnd_err_acc, dim=0).view(seqlen, bsz, 1)
 
         # T x B x C -> B x T x C
         x = x.transpose(1, 0)
@@ -334,7 +369,7 @@ class GRURNDDecoder(FairseqIncrementalDecoder):
             attn_scores = attn_scores.transpose(0, 2)
         else:
             attn_scores = None
-        return x, attn_scores
+        return x, {"attn": attn_scores, "rnd_err": rnd_err_acc}
 
     def output_layer(self, x):
         """Project features to the vocabulary size."""
@@ -548,6 +583,8 @@ class TransformerGRURNDModel(FairseqEncoderDecoderModel):
                             help='dropout probability for decoder input embedding')
         parser.add_argument('--decoder-dropout-out', type=float, metavar='D',
                             help='dropout probability for decoder output')
+        parser.add_argument('--decoder-hidden-state-in-output', action='store_true',
+                            help='include the hidden state in the computation of the output (Luong et al. 2015) ')
 
         # RND
         parser.add_argument('--rnd-base-n-hidden-layers', type=int, metavar='N',
@@ -560,6 +597,16 @@ class TransformerGRURNDModel(FairseqEncoderDecoderModel):
                             help='RND model: scaling coefficient for RND projection applied to the recurrent states')
         parser.add_argument('--rnd-scale-output', type=float, metavar='D',
                             help='RND model: scaling coefficient for RND projection applied to the decoder context output')
+        parser.add_argument('--rnd-detach-model-gradient-from-ood-loss', action='store_true',
+                            help='do not propagate the gradient from the target token loss to the OOD detector (requires label_smoothed_cross_entropy_with_rnd criterion)')
+        parser.add_argument('--rnd-keep-ood-loss', action='store_true',
+                            help='keep OOD loss for label_smoothed_cross_entropy_with_rnd criterion')
+        parser.add_argument('--rnd-no-layernorm-in-base-layers', action='store_true',
+                            help='disable layernorm in the base layers of the OOD detector')
+        parser.add_argument('--rnd-no-layernorm-in-projection-layers', action='store_true',
+                            help='disable layernorm in the projection layers of the OOD detector')
+        parser.add_argument('--rnd-ood-scaling-on-attention-head-value', action='store_true',
+                            help='apply OOD scaling to the output of the cross-multiattention head')
         #
         
         # fmt: on
@@ -771,12 +818,18 @@ def base_architecture(args):
     args.decoder_out_embed_dim = getattr(args, "decoder_out_embed_dim", 512)
     args.decoder_dropout_in = getattr(args, "decoder_dropout_in", args.dropout)
     args.decoder_dropout_out = getattr(args, "decoder_dropout_out", args.dropout)
+    args.decoder_hidden_state_in_output = getattr(args, "decoder_hidden_state_in_output", False)
     # RND
     args.rnd_base_n_hidden_layers = getattr(args, 'rnd_base_n_hidden_layers', 1)
     args.rnd_student_n_residual_blocks = getattr(args, 'rnd_student_n_residual_blocks', 1)
     args.rnd_student_residual_inner_dim = getattr(args, 'rnd_student_residual_inner_dim', 2048)
     args.rnd_scale_state = torch.scalar_tensor(getattr(args, 'rnd_scale_state', -1.0))
     args.rnd_scale_output = torch.scalar_tensor(getattr(args, 'rnd_scale_output', -1.0))
+    args.rnd_detach_model_gradient_from_ood_loss = getattr(args, "rnd_detach_model_gradient_from_ood_loss", False)
+    args.rnd_keep_ood_loss = getattr(args, "rnd_keep_ood_loss", False)
+    args.rnd_no_layernorm_in_base_layers = getattr(args, "rnd_no_layernorm_in_base_layers", False)
+    args.rnd_no_layernorm_in_projection_layers = getattr(args, "rnd_no_layernorm_in_projection_layers", False)
+    args.rnd_ood_scaling_on_attention_head_value = getattr(args, "rnd_ood_scaling_on_attention_head_value", False)
     #
 
 @register_model_architecture("transformer_gru_rnd", "transformer_gru_rnd_iwslt_de_en")

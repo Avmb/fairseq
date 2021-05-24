@@ -103,6 +103,9 @@ class GRUDecoder(FairseqIncrementalDecoder):
                 encoder_decoder_attention=True,)
         else:
             self.attention = None
+            
+        if args.decoder_hidden_state_in_output:
+            self.hidden_attn_combination_fc = Linear(2*hidden_size, hidden_size, bias=False)
 
         if hidden_size != out_embed_dim:
             self.additional_fc = Linear(hidden_size, out_embed_dim)
@@ -227,6 +230,8 @@ class GRUDecoder(FairseqIncrementalDecoder):
                     attn_scores[:, j, :] = attn_out[1].squeeze(1).transpose(0, 1) # B x SRCLEN
             else:
                 out = hidden
+            if self.args.decoder_hidden_state_in_output:
+                out = self.hidden_attn_combination_fc(torch.cat((out, hidden), dim=-1))
             out = self.dropout_out_module(out)
 
             # input feeding
@@ -470,6 +475,8 @@ class TransformerGRUModel(FairseqEncoderDecoderModel):
                             help='dropout probability for decoder input embedding')
         parser.add_argument('--decoder-dropout-out', type=float, metavar='D',
                             help='dropout probability for decoder output')
+        parser.add_argument('--decoder-hidden-state-in-output', action='store_true',
+                            help='include the hidden state in the computation of the output (Luong et al. 2015) ')
 
         # fmt: on
 
@@ -680,6 +687,8 @@ def base_architecture(args):
     args.decoder_out_embed_dim = getattr(args, "decoder_out_embed_dim", 512)
     args.decoder_dropout_in = getattr(args, "decoder_dropout_in", args.dropout)
     args.decoder_dropout_out = getattr(args, "decoder_dropout_out", args.dropout)
+    args.decoder_hidden_state_in_output = getattr(args, "decoder_hidden_state_in_output", False)
+    
 
 @register_model_architecture("transformer_gru", "transformer_gru_iwslt_de_en")
 def transformer_gru_iwslt_de_en(args):

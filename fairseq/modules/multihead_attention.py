@@ -37,6 +37,7 @@ class MultiheadAttention(nn.Module):
         encoder_decoder_attention=False,
         q_noise=0.0,
         qn_block_size=8,
+        normalized_attention=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -83,6 +84,12 @@ class MultiheadAttention(nn.Module):
             self.bias_k = self.bias_v = None
 
         self.add_zero_attn = add_zero_attn
+        
+        self.normalized_attention = normalized_attention
+        if self.normalized_attention:
+            self.attention_gain = quant_noise(
+                nn.Linear(embed_dim, num_heads, bias=True), q_noise, qn_block_size
+            )
 
         self.reset_parameters()
 
@@ -110,6 +117,13 @@ class MultiheadAttention(nn.Module):
             nn.init.xavier_normal_(self.bias_k)
         if self.bias_v is not None:
             nn.init.xavier_normal_(self.bias_v)
+            
+        if self.normalized_attention:
+            #nn.init.xavier_uniform_(self.attention_gain.weight)
+            nn.init.zeros_(self.attention_gain.weight)
+            #nn.init.zeros_(self.attention_gain.bias)
+            nn.init.ones_(self.attention_gain.bias)
+            #nn.init.normal_(self.attention_gain.bias, mean=1.0, std=0.1 * math.sqrt(2.0 / self.embed_dim))
 
     def forward(
         self,
@@ -162,6 +176,7 @@ class MultiheadAttention(nn.Module):
             and not is_tpu  # don't use PyTorch version on TPUs
             and incremental_state is None
             and not static_kv
+            and not (self.normalized_attention and self.encoder_decoder_attention)
             # A workaround for quantization to work. Otherwise JIT compilation
             # treats bias in linear module as method.
             and not torch.jit.is_scripting()
@@ -354,6 +369,35 @@ class MultiheadAttention(nn.Module):
                 attn_weights = attn_weights.transpose(0, 2)
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
+        # here attn_weights with encoder_decoder_attention is (Batch * Heads) x QueryT x KeyT
+        if self.normalized_attention and self.encoder_decoder_attention:
+            # compute the standard deviation of the attention on the key time dimension while ignoring masked elements
+            attn_final_mask = torch.isinf(attn_weights)
+            attn_final_neg_mask = torch.logical_not(attn_final_mask)
+            attn_weights_zero_masked = attn_weights.masked_fill(attn_final_mask, 0.0)
+            attn_denom = attn_final_neg_mask.sum(dim=-1, keepdim=True) + 1e-05
+            attn_weight_mean = attn_weights_zero_masked.sum(dim=-1, keepdim=True) / attn_denom # (Batch * Heads) x QueryT x 1
+            attn_weight_centered_squares_zero_masked = torch.square(attn_weights_zero_masked - attn_weight_mean).masked_fill(attn_final_mask, 0.0)
+            attn_weight_std = torch.sqrt(attn_weight_centered_squares_zero_masked.sum(dim=-1, keepdim=True) / attn_denom) # (Batch * Heads) x QueryT x 1
+            
+            # assume unmasked
+            #attn_weight_std = attn_weights.std(dim=-1, keepdim=True)
+            #attn_weight_std = torch.ones_like(attn_weights) 
+            
+            # compute gain
+            attn_gain = self.attention_gain(query) # QueryT x Batch x Heads
+            #attn_gain = F.sigmoid(attn_gain)
+            attn_gain = attn_gain.view(tgt_len, bsz * self.num_heads).transpose(0, 1).unsqueeze(-1) # (Batch * Heads) x QueryT x 1
+            #attn_gain = torch.ones_like(attn_weights) 
+            
+            # rescale
+            attn_weights = attn_weights.masked_fill(attn_final_mask, 0.0)
+            attn_weights = attn_weights / (attn_weight_std + 1e-05)
+            attn_weights = attn_weights * attn_gain
+            attn_weights = attn_weights.masked_fill(attn_final_mask, float("-inf"))
+            #print("attn_final_neg_mask: %s, attn_weight_std: %s, attn_gain: %s, attn_weights: %s" % (attn_final_neg_mask.shape, attn_weight_std.shape, attn_gain.shape, attn_weights.shape))
+            #print("sum: %s, attn_weight_std: %s, attn_gain: %s" % (attn_weights.sum().item(), attn_weight_std.mean().item(), attn_gain.mean().item()))
+        
         if before_softmax:
             return attn_weights, v
 

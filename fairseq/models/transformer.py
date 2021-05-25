@@ -209,12 +209,18 @@ class TransformerModel(FairseqEncoderDecoderModel):
                 '--offload-activations are passed.'
             )
         )
+
+        # Normalized attention        
+        parser.add_argument('--normalized-encoder-decoder-attention', action='store_true',
+                            help='Normalized encoder decoder attention')
+        
         # fmt: on
 
     @classmethod
     def build_model(cls, args, task):
         """Build a new model instance."""
 
+        #torch.autograd.set_detect_anomaly(True)
         # make sure all arguments are present in older models
         base_architecture(args)
 
@@ -1128,6 +1134,9 @@ def base_architecture(args):
     args.quant_noise_pq = getattr(args, "quant_noise_pq", 0)
     args.quant_noise_pq_block_size = getattr(args, "quant_noise_pq_block_size", 8)
     args.quant_noise_scalar = getattr(args, "quant_noise_scalar", 0)
+    
+    # Normalized attention
+    args.normalized_encoder_decoder_attention = getattr(args, "normalized_encoder_decoder_attention", False)
 
 
 @register_model_architecture("transformer", "transformer_iwslt_de_en")

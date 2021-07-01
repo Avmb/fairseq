@@ -268,7 +268,9 @@ class TransformerDecoderLayer(nn.Module):
             encoder_decoder_attention=True,
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
-            normalized_attention=getattr(args, "normalized_encoder_decoder_attention", False)
+            normalized_attention=getattr(args, "normalized_encoder_decoder_attention", False),
+            normalized_attention_logsoftmax=getattr(args, "normalized_encoder_decoder_attention_logsoftmax", False),
+            normalized_attention_by_entropy=getattr(args, "normalized_encoder_decoder_attention_by_entropy", False),
         )
 
     def prepare_for_onnx_export_(self):

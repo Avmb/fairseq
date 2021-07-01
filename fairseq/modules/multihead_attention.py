@@ -38,6 +38,8 @@ class MultiheadAttention(nn.Module):
         q_noise=0.0,
         qn_block_size=8,
         normalized_attention=False,
+        normalized_attention_logsoftmax=False,
+        normalized_attention_by_entropy=False
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -86,6 +88,8 @@ class MultiheadAttention(nn.Module):
         self.add_zero_attn = add_zero_attn
         
         self.normalized_attention = normalized_attention
+        self.normalized_attention_logsoftmax = normalized_attention_logsoftmax
+        self.normalized_attention_by_entropy = normalized_attention_by_entropy
         if self.normalized_attention:
             self.attention_gain = quant_noise(
                 nn.Linear(embed_dim, num_heads, bias=True), q_noise, qn_block_size
@@ -374,11 +378,21 @@ class MultiheadAttention(nn.Module):
             # compute the standard deviation of the attention on the key time dimension while ignoring masked elements
             attn_final_mask = torch.isinf(attn_weights)
             attn_final_neg_mask = torch.logical_not(attn_final_mask)
+            if self.normalized_attention_logsoftmax:
+                attn_probs = utils.softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
+                attn_weights = torch.log(attn_probs + 1e-7)
             attn_weights_zero_masked = attn_weights.masked_fill(attn_final_mask, 0.0)
             attn_denom = attn_final_neg_mask.sum(dim=-1, keepdim=True) + 1e-05
-            attn_weight_mean = attn_weights_zero_masked.sum(dim=-1, keepdim=True) / attn_denom # (Batch * Heads) x QueryT x 1
-            attn_weight_centered_squares_zero_masked = torch.square(attn_weights_zero_masked - attn_weight_mean).masked_fill(attn_final_mask, 0.0)
-            attn_weight_std = torch.sqrt(attn_weight_centered_squares_zero_masked.sum(dim=-1, keepdim=True) / attn_denom) # (Batch * Heads) x QueryT x 1
+            if not self.normalized_attention_by_entropy:
+                attn_weight_mean = attn_weights_zero_masked.sum(dim=-1, keepdim=True) / attn_denom # (Batch * Heads) x QueryT x 1
+                attn_weight_centered_squares_zero_masked = torch.square(attn_weights_zero_masked - attn_weight_mean).masked_fill(attn_final_mask, 0.0)
+                attn_weight_std = torch.sqrt(attn_weight_centered_squares_zero_masked.sum(dim=-1, keepdim=True) / attn_denom) # (Batch * Heads) x QueryT x 1
+                attn_weight_scale = attn_weight_std
+            elif self.normalized_attention_by_entropy:
+                attn_entropy = (attn_probs * attn_weights_zero_masked).sum(dim=-1, keepdim=True) # (Batch * Heads) x QueryT x 1
+                attn_weight_scale = attn_entropy
+            else:
+                assert(False)
             
             # assume unmasked
             #attn_weight_std = attn_weights.std(dim=-1, keepdim=True)
@@ -392,7 +406,7 @@ class MultiheadAttention(nn.Module):
             
             # rescale
             attn_weights = attn_weights.masked_fill(attn_final_mask, 0.0)
-            attn_weights = attn_weights / (attn_weight_std + 1e-05)
+            attn_weights = attn_weights / (attn_weight_scale + 1e-05)
             attn_weights = attn_weights * attn_gain
             attn_weights = attn_weights.masked_fill(attn_final_mask, float("-inf"))
             #print("attn_final_neg_mask: %s, attn_weight_std: %s, attn_gain: %s, attn_weights: %s" % (attn_final_neg_mask.shape, attn_weight_std.shape, attn_gain.shape, attn_weights.shape))

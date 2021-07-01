@@ -213,6 +213,10 @@ class TransformerModel(FairseqEncoderDecoderModel):
         # Normalized attention        
         parser.add_argument('--normalized-encoder-decoder-attention', action='store_true',
                             help='Normalized encoder decoder attention')
+        parser.add_argument('--normalized-encoder-decoder-attention-logsoftmax', action='store_true',
+                            help='Apply softmax then log on the attention weights before normalizing')
+        parser.add_argument('--normalized-encoder-decoder-attention-by-entropy', action='store_true',
+                            help='Normalize by entropy rather than std')
         
         # fmt: on
 
@@ -1137,7 +1141,8 @@ def base_architecture(args):
     
     # Normalized attention
     args.normalized_encoder_decoder_attention = getattr(args, "normalized_encoder_decoder_attention", False)
-
+    args.normalized_encoder_decoder_attention_logsoftmax = getattr(args, "normalized_encoder_decoder_attention_logsoftmax", False)
+    args.normalized_encoder_decoder_attention_by_entropy = getattr(args, "normalized_encoder_decoder_attention_by_entropy", False)
 
 @register_model_architecture("transformer", "transformer_iwslt_de_en")
 def transformer_iwslt_de_en(args):

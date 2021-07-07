@@ -84,6 +84,9 @@ class TransformerEncoderLayer(nn.Module):
             self_attention=True,
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
+            positional_embeddings_in_attention=getattr(args, "positional_embeddings_in_attention", False),
+            symmetric_kv_context_params=getattr(args, "encoder_self_symmetric_kv_context_params", False),
+            symmetric_kv_positional_params=getattr(args, "encoder_self_symmetric_kv_positional_params", False),
         )
 
     def residual_connection(self, x, residual):
@@ -256,6 +259,9 @@ class TransformerDecoderLayer(nn.Module):
             self_attention=not getattr(args, "cross_self_attention", False),
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
+            positional_embeddings_in_attention=getattr(args, "positional_embeddings_in_attention", False),
+            symmetric_kv_context_params=getattr(args, "decoder_self_symmetric_kv_context_params", False),
+            symmetric_kv_positional_params=getattr(args, "decoder_self_symmetric_kv_positional_params", False),
         )
 
     def build_encoder_attention(self, embed_dim, args):
@@ -271,6 +277,9 @@ class TransformerDecoderLayer(nn.Module):
             normalized_attention=getattr(args, "normalized_encoder_decoder_attention", False),
             normalized_attention_logsoftmax=getattr(args, "normalized_encoder_decoder_attention_logsoftmax", False),
             normalized_attention_by_entropy=getattr(args, "normalized_encoder_decoder_attention_by_entropy", False),
+            positional_embeddings_in_attention=getattr(args, "positional_embeddings_in_attention", False),
+            symmetric_kv_context_params=getattr(args, "cross_symmetric_kv_context_params", False),
+            symmetric_kv_positional_params=getattr(args, "cross_symmetric_kv_positional_params", False),
         )
 
     def prepare_for_onnx_export_(self):

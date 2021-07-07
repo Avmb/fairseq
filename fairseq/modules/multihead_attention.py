@@ -14,6 +14,7 @@ from fairseq.modules.fairseq_dropout import FairseqDropout
 from fairseq.modules.quant_noise import quant_noise
 from torch import Tensor, nn
 from torch.nn import Parameter
+from fairseq.modules.sinusoidal_positional_embedding import SinusoidalPositionalEmbedding
 
 
 @with_incremental_state
@@ -39,7 +40,11 @@ class MultiheadAttention(nn.Module):
         qn_block_size=8,
         normalized_attention=False,
         normalized_attention_logsoftmax=False,
-        normalized_attention_by_entropy=False
+        normalized_attention_by_entropy=False,
+        positional_embeddings_in_attention=False,
+        symmetric_kv_context_params=False,
+        symmetric_kv_positional_params=False,
+        #normalized_attention_by_positional_score=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -51,6 +56,10 @@ class MultiheadAttention(nn.Module):
         self.dropout_module = FairseqDropout(
             dropout, module_name=self.__class__.__name__
         )
+        self.positional_embeddings_in_attention=positional_embeddings_in_attention
+        self.symmetric_kv_context_params=symmetric_kv_context_params
+        self.symmetric_kv_positional_params=symmetric_kv_positional_params
+        #self.normalized_attention_by_positional_score=normalized_attention_by_positional_score
 
         self.head_dim = embed_dim // num_heads
         assert (
@@ -74,6 +83,9 @@ class MultiheadAttention(nn.Module):
         self.q_proj = quant_noise(
             nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
         )
+        if self.symmetric_kv_context_params:
+            assert self.kdim == embed_dim, ("Symmetric context attention requires kdim == embed_dim")
+            self.q_proj.weight = self.k_proj.weight
 
         self.out_proj = quant_noise(
             nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
@@ -94,6 +106,19 @@ class MultiheadAttention(nn.Module):
             self.attention_gain = quant_noise(
                 nn.Linear(embed_dim, num_heads, bias=True), q_noise, qn_block_size
             )
+            
+        if self.positional_embeddings_in_attention:
+            self.pos_k_proj = quant_noise(
+                nn.Linear(self.kdim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
+            self.pos_q_proj = quant_noise(
+                nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
+            )
+            if self.symmetric_kv_positional_params:
+                assert self.kdim == embed_dim, ("Symmetric positional attention requires kdim == embed_dim")
+                self.pos_q_proj.weight = self.pos_k_proj.weight
+            self.pos_embeddings = SinusoidalPositionalEmbedding(embed_dim, None)
+            
 
         self.reset_parameters()
 
@@ -109,10 +134,16 @@ class MultiheadAttention(nn.Module):
             nn.init.xavier_uniform_(self.k_proj.weight, gain=1 / math.sqrt(2))
             nn.init.xavier_uniform_(self.v_proj.weight, gain=1 / math.sqrt(2))
             nn.init.xavier_uniform_(self.q_proj.weight, gain=1 / math.sqrt(2))
+            if self.positional_embeddings_in_attention:
+                nn.init.xavier_uniform_(self.pos_k_proj.weight, gain=1 / math.sqrt(2))
+                nn.init.xavier_uniform_(self.pos_q_proj.weight, gain=1 / math.sqrt(2))
         else:
             nn.init.xavier_uniform_(self.k_proj.weight)
             nn.init.xavier_uniform_(self.v_proj.weight)
             nn.init.xavier_uniform_(self.q_proj.weight)
+            if self.positional_embeddings_in_attention:
+                nn.init.xavier_uniform_(self.pos_k_proj.weight)
+                nn.init.xavier_uniform_(self.pos_q_proj.weight)
 
         nn.init.xavier_uniform_(self.out_proj.weight)
         if self.out_proj.bias is not None:
@@ -181,6 +212,7 @@ class MultiheadAttention(nn.Module):
             and incremental_state is None
             and not static_kv
             and not (self.normalized_attention and self.encoder_decoder_attention)
+            and not self.positional_embeddings_in_attention
             # A workaround for quantization to work. Otherwise JIT compilation
             # treats bias in linear module as method.
             and not torch.jit.is_scripting()
@@ -241,7 +273,7 @@ class MultiheadAttention(nn.Module):
             k = self.k_proj(key)
             v = self.v_proj(value)
         q *= self.scaling
-
+        
         if self.bias_k is not None:
             assert self.bias_v is not None
             k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)])
@@ -319,6 +351,45 @@ class MultiheadAttention(nn.Module):
         assert k is not None
         assert k.size(1) == src_len
 
+        if self.positional_embeddings_in_attention:
+            # todo: precompute
+            pos_q_timestep = utils.get_incremental_state(
+                self, incremental_state, 'pos_q_timestep',
+            )
+            #print(incremental_state != None, pos_q_timestep.item() if pos_q_timestep is not None else None, end=" ")
+            #if (incremental_state is not None) and (pos_q_timestep is None):
+            if (pos_q_timestep is None):
+                pos_q_timestep = torch.tensor(0, dtype=torch.int64, device=q.device)
+            #print(pos_q_timestep.item() if pos_q_timestep is not None else None)
+            
+            pos_q = self.pos_q_proj(self.pos_embeddings(q.new_ones([bsz, tgt_len]), timestep=pos_q_timestep, incremental_state=incremental_state)).transpose(0, 1) # tgt_len x bsz
+            pos_k = self.pos_k_proj(self.pos_embeddings(q.new_ones([bsz, src_len]))).transpose(0, 1) # src_len x bsz
+            pos_q *= self.scaling
+            #if incremental_state is not None:
+                #print(pos_q.shape, pos_k.shape)
+                #print(saved_state.keys())
+                #print(pos_q[0, 0, :10])
+                #print("")
+            pos_q = (
+                pos_q.contiguous()
+                .view(tgt_len, bsz * self.num_heads, self.head_dim)
+                .transpose(0, 1)
+            )
+            pos_k = (
+                pos_k.contiguous()
+                .view(-1, bsz * self.num_heads, self.head_dim)
+                .transpose(0, 1)
+            )
+            pos_attn_weights = torch.bmm(pos_q, pos_k.transpose(1, 2))
+            pos_attn_weights = self.apply_sparse_mask(pos_attn_weights, tgt_len, src_len, bsz)
+            assert list(pos_attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
+            
+            if True: #if (incremental_state is not None):
+                utils.set_incremental_state(
+                    self, incremental_state, 'pos_q_timestep', pos_q_timestep+1,
+                )
+
+
         # This is part of a workaround to get around fork/join parallelism
         # not supporting Optional types.
         if key_padding_mask is not None and key_padding_mask.dim() == 0:
@@ -353,6 +424,9 @@ class MultiheadAttention(nn.Module):
 
         assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
+        if self.positional_embeddings_in_attention:
+            attn_weights = attn_weights + pos_attn_weights
+        
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(0)
             if self.onnx_trace:

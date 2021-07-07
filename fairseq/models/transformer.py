@@ -209,6 +209,22 @@ class TransformerModel(FairseqEncoderDecoderModel):
                 '--offload-activations are passed.'
             )
         )
+        
+        # Kernelized attention arXiv:1908.11775 (Tsai et al. 2019) "Transformer Dissection"
+        parser.add_argument('--positional-embeddings-in-attention', action='store_true',
+                            help='Add sinusoidal positional embeddings in the attention heads (Tsai et al. 2019)')
+        parser.add_argument('--encoder-self-symmetric-kv-context-params', action='store_true',
+                            help='Tie the Key and Query context (non-positional) parameter martices in encoder self-attention')
+        parser.add_argument('--encoder-self-symmetric-kv-positional-params', action='store_true',
+                            help='Tie the Key and Query positional parameter martices in encoder self-attention')
+        parser.add_argument('--decoder-self-symmetric-kv-context-params', action='store_true',
+                            help='Tie the Key and Query context (non-positional) parameter martices in decoder self-attention')
+        parser.add_argument('--decoder-self-symmetric-kv-positional-params', action='store_true',
+                            help='Tie the Key and Query positional parameter martices in decoder self-attention')
+        parser.add_argument('--cross-symmetric-kv-context-params', action='store_true',
+                            help='Tie the Key and Query context (non-positional) parameter martices in encoder-decoder cross-attention')
+        parser.add_argument('--cross-symmetric-kv-positional-params', action='store_true',
+                            help='Tie the Key and Query positional parameter martices in encoder-decoder cross-attention')
 
         # Normalized attention        
         parser.add_argument('--normalized-encoder-decoder-attention', action='store_true',
@@ -1138,6 +1154,15 @@ def base_architecture(args):
     args.quant_noise_pq = getattr(args, "quant_noise_pq", 0)
     args.quant_noise_pq_block_size = getattr(args, "quant_noise_pq_block_size", 8)
     args.quant_noise_scalar = getattr(args, "quant_noise_scalar", 0)
+
+    # Kernelized attention arXiv:1908.11775 (Tsai et al. 2019) "Transformer Dissection"
+    args.positional_embeddings_in_attention = getattr(args, "positional_embeddings_in_attention", False)
+    args.encoder_self_symmetric_kv_context_params = getattr(args, "encoder_self_symmetric_kv_context_params", False)
+    args.encoder_self_symmetric_kv_positional_params = getattr(args, "encoder_self_symmetric_kv_positional_params", False)
+    args.decoder_self_symmetric_kv_context_params = getattr(args, "decoder_self_symmetric_kv_context_params", False)
+    args.decoder_self_symmetric_kv_positional_params = getattr(args, "decoder_self_symmetric_kv_positional_params", False)
+    args.cross_symmetric_kv_context_params = getattr(args, "cross_symmetric_kv_context_params", False)
+    args.cross_symmetric_kv_positional_params = getattr(args, "cross_symmetric_kv_positional_params", False)
     
     # Normalized attention
     args.normalized_encoder_decoder_attention = getattr(args, "normalized_encoder_decoder_attention", False)
